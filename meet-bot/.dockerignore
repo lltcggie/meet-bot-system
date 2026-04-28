@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.vscode
+.idea
+data/
+references/
+service_account.json
+README.md

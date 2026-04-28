@@ -1,0 +1,43 @@
+services:
+  meet-bot:
+    build:
+      context: ./meet-bot
+    image: meet-bot:latest
+    container_name: meet-bot
+    restart: unless-stopped
+    environment:
+      SERVICE_ACCOUNT_JSON: ${SERVICE_ACCOUNT_JSON}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN}
+      WEBHOOK_SHARED_SECRET: ${WEBHOOK_SHARED_SECRET}
+      PORT: "8080"
+      PREFIX_MAPPING_PATH: /app/data/meetbot_mapping.json
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  meet-webhook:
+    build:
+      context: ./meet-webhook
+    image: meet-webhook:latest
+    container_name: meet-webhook
+    restart: unless-stopped
+    depends_on:
+      meet-bot:
+        condition: service_healthy
+    environment:
+      SERVICE_ACCOUNT_JSON: ${SERVICE_ACCOUNT_JSON}
+      ADMIN_USER_EMAIL: ${ADMIN_USER_EMAIL}
+      PROJECT_ID: ${PROJECT_ID}
+      PUBSUB_TOPIC_ID: ${PUBSUB_TOPIC_ID}
+      PUBSUB_SUBSCRIPTION_ID: ${PUBSUB_SUBSCRIPTION_ID}
+      SUBSCRIPTION_TTL: ${SUBSCRIPTION_TTL:-86400s}
+      RECREATE_SUBSCRIPTION: ${RECREATE_SUBSCRIPTION:-false}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://meet-bot:8080/webhook}
+      WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-30}
+      WEBHOOK_SHARED_SECRET: ${WEBHOOK_SHARED_SECRET}
