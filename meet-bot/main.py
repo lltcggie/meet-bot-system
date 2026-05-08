@@ -56,6 +56,9 @@ PREFIX_MAPPING: dict[str, dict[str, str]] = {}
 # PREFIX_MAPPING の読み書きを保護するロック
 _PREFIX_MAPPING_LOCK = threading.Lock()
 
+# Slack が <#CXXXX|name> / <#CXXXX> 形式に自動展開したチャンネルリンクからIDを抽出する
+SLACK_CHANNEL_LINK_PATTERN = re.compile(r"^<#([A-Z0-9]+)(?:\|[^>]*)?>$")
+
 
 def load_prefix_mapping() -> None:
     """永続化されたプレフィックス設定をロードしてメモリ上のマッピングへ反映。"""
@@ -75,9 +78,15 @@ def load_prefix_mapping() -> None:
     for key, value in data.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             continue
+        raw_channel = str(value.get("slack_channel", "") or "").strip()
+        link_match = SLACK_CHANNEL_LINK_PATTERN.match(raw_channel)
+        if link_match:
+            slack_channel = link_match.group(1)
+        else:
+            slack_channel = raw_channel
         cleaned[key] = {
             "drive_folder_id": str(value.get("drive_folder_id", "") or ""),
-            "slack_channel": str(value.get("slack_channel", "") or ""),
+            "slack_channel": slack_channel,
         }
     with _PREFIX_MAPPING_LOCK:
         PREFIX_MAPPING.clear()
@@ -131,6 +140,26 @@ def remove_prefix_mapping_entry(prefix: str) -> bool:
         return True
 
 SLACK_API_BASE = "https://slack.com/api"
+
+
+def normalize_slack_channel(value: str) -> tuple[str | None, str | None]:
+    """ユーザー入力のSlackチャンネル指定を chat.postMessage が受理する形式に正規化する。
+
+    返り値: (正規化済みチャンネル, エラーメッセージ)。エラー時は (None, message)。
+    """
+    channel = (value or "").strip()
+    if not channel:
+        return None, "Slackチャンネルが空です"
+    m = SLACK_CHANNEL_LINK_PATTERN.match(channel)
+    if m:
+        return m.group(1), None
+    if channel.startswith("#"):
+        return None, (
+            "Slackチャンネルはチャンネル名(`#name`)ではなくチャンネルID(例: `C0123456789`)で指定してください。"
+            "チャンネル詳細画面の最下部に表示される Channel ID をコピーしてください"
+        )
+    return channel, None
+
 
 # (HH:MM:SS) の時刻表記を検出するパターン
 TIMESTAMP_PATTERN = re.compile(r"\((\d{1,2}):(\d{2}):(\d{2})\)")
@@ -993,12 +1022,16 @@ def handle_prefix_command(user_id: str, text: str) -> str:
         prefix, folder_id, channel = args
         if not prefix:
             return "プレフィックスが空です"
+        normalized_channel, channel_error = normalize_slack_channel(channel)
+        if channel_error:
+            return channel_error
+        assert normalized_channel is not None
         try:
-            set_prefix_mapping_entry(prefix, folder_id, channel)
+            set_prefix_mapping_entry(prefix, folder_id, normalized_channel)
         except OSError as exc:
             logger.exception("PREFIX_MAPPING の保存に失敗")
             return f"保存に失敗しました: {exc}"
-        return f"プレフィックス `{prefix}` を設定しました (folder=`{folder_id}`, channel=`{channel}`)"
+        return f"プレフィックス `{prefix}` を設定しました (folder=`{folder_id}`, channel=`{normalized_channel}`)"
 
     if subcommand == "remove":
         if len(args) != 1:
