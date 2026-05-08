@@ -72,6 +72,7 @@ RECORDING_FILE_IDS: dict[str, list[str]] = {}
 TRANSCRIPT_FILE_IDS: dict[str, list[str]] = {}
 USER_EMAIL_CACHE: dict[str, str] = {}
 KNOWN_ORG_USER_IDS: set[str] = set()
+SUBSCRIPTION_TO_USER: dict[str, str] = {}
 
 EVENT_TYPES = [
     "google.workspace.meet.conference.v2.ended",
@@ -200,6 +201,38 @@ def get_user_id_from_event(payload: dict, event_subject: str) -> str | None:
         user_id = target_resource[len(prefix):]
         if user_id and "/" not in user_id and is_valid_org_user_id(user_id):
             return user_id
+
+    subscription_name = subscription.get("name") or ""
+    if subscription_name and subscription_name in SUBSCRIPTION_TO_USER:
+        return SUBSCRIPTION_TO_USER[subscription_name]
+
+    if subscription_name:
+        user_id = fetch_user_id_from_subscription(subscription_name)
+        if user_id:
+            return user_id
+
+    return None
+
+
+def fetch_user_id_from_subscription(subscription_name: str) -> str | None:
+    """Workspace Events APIからサブスクリプション情報を取得し、対象ユーザーIDを抽出する。"""
+    prefix = "//cloudidentity.googleapis.com/users/"
+    session = google_requests.AuthorizedSession(USER_CREDENTIALS)
+    url = f"https://workspaceevents.googleapis.com/v1/{subscription_name}"
+    try:
+        response = session.get(url)
+        if response.status_code != 200:
+            logger.warning("サブスクリプション情報取得失敗: %s %s", subscription_name, response.status_code)
+            return None
+        data = response.json()
+        target_resource = data.get("targetResource") or ""
+        if target_resource.startswith(prefix):
+            user_id = target_resource[len(prefix):]
+            if user_id and "/" not in user_id and is_valid_org_user_id(user_id):
+                SUBSCRIPTION_TO_USER[subscription_name] = user_id
+                return user_id
+    except Exception as exc:
+        logger.warning("サブスクリプション情報取得で例外: %s %s", subscription_name, exc)
     return None
 
 
@@ -357,11 +390,15 @@ def ensure_subscription_for_user(user_id: str, user_email: str = "") -> bool:
             name = response.json().get("response", {}).get('name')
         except ValueError:
             pass
+        if name:
+            SUBSCRIPTION_TO_USER[name] = user_id
         logger.info("サブスクリプションを作成(%s): %s", user_email, name or "不明")
         return True
 
     if response.status_code == 409:
         existing_name = get_existing_subscription_name(response)
+        if existing_name:
+            SUBSCRIPTION_TO_USER[existing_name] = user_id
         if existing_name and should_recreate_subscription():
             logger.debug("既存サブスクリプションを削除開始(%s): %s", user_email, existing_name)
             if delete_workspace_subscription(existing_name, credentials=credentials):
@@ -372,7 +409,14 @@ def ensure_subscription_for_user(user_id: str, user_email: str = "") -> bool:
                     credentials=credentials,
                 )
                 if response.status_code == 200:
-                    logger.info("サブスクリプションを再作成(%s): %s", user_email, existing_name)
+                    new_name = None
+                    try:
+                        new_name = response.json().get("response", {}).get('name')
+                    except ValueError:
+                        pass
+                    if new_name:
+                        SUBSCRIPTION_TO_USER[new_name] = user_id
+                    logger.info("サブスクリプションを再作成(%s): %s", user_email, new_name or existing_name)
                     return True
                 logger.error("サブスクリプション再作成失敗(%s): %s", user_email, response.status_code)
                 logger.error(response.text)
@@ -430,6 +474,7 @@ def handle_subscription_lifecycle(event_type: str, payload: dict, event_subject:
             new_name = get_created_subscription_name(response)
             if new_name:
                 WORKSPACE_SUBSCRIPTION_NAME = new_name
+                SUBSCRIPTION_TO_USER[new_name] = user_id
             logger.info("期限切れ後にサブスクリプションを再作成しました")
         else:
             logger.error("再サブスクライブ失敗: %s", response.status_code)
