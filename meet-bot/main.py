@@ -371,7 +371,11 @@ def convert_text_with_timestamps(text: str, recording_id: str | None) -> str:
     return "".join(result)
 
 
-def render_element(el: dict[str, Any], recording_id: str | None) -> str:
+def render_element(
+    el: dict[str, Any],
+    recording_id: str | None,
+    mention_channel: str | None = None,
+) -> str:
     """textRun / person / richLink を mrkdwn 文字列へ変換。"""
     text_run = el.get("textRun")
     if text_run is not None:
@@ -397,7 +401,7 @@ def render_element(el: dict[str, Any], recording_id: str | None) -> str:
         email = props.get("email") or ""
         name = props.get("name") or ""
         if email:
-            slack_user_id = slack_user_id_for_email_cached(email)
+            slack_user_id = slack_user_id_for_email_cached(email, mention_channel)
             if slack_user_id:
                 return f"<@{slack_user_id}>"
         if name:
@@ -421,6 +425,7 @@ def render_element(el: dict[str, Any], recording_id: str | None) -> str:
 def split_paragraph_into_lines(
     paragraph: dict[str, Any],
     recording_id: str | None,
+    mention_channel: str | None = None,
 ) -> list[tuple[bool, str]]:
     """段落を (is_bold_heading, rendered_mrkdwn) の行リストへ分解する。
 
@@ -431,7 +436,7 @@ def split_paragraph_into_lines(
     # セグメント: (is_bold, text) をフラット列にする
     segments: list[tuple[bool, str]] = []
     for el in elements:
-        rendered = render_element(el, recording_id)
+        rendered = render_element(el, recording_id, mention_channel)
         if not rendered:
             continue
         text_run = el.get("textRun")
@@ -537,6 +542,7 @@ def doc_to_slack_blocks(
     recording_id: str | None,
     meeting_name: str,
     recording_ids: list[str] | None = None,
+    mention_channel: str | None = None,
 ) -> list[dict[str, Any]]:
     content = document.get("body", {}).get("content", [])
     # rendered_lines: list of (kind, text)  kind in {"heading", "subheading", "text"}
@@ -558,7 +564,7 @@ def doc_to_slack_blocks(
         )
         if is_noise_line(paragraph_plain):
             continue
-        para_lines = split_paragraph_into_lines(paragraph, recording_id)
+        para_lines = split_paragraph_into_lines(paragraph, recording_id, mention_channel)
         for is_bold_inline, text in para_lines:
             if is_noise_line(text):
                 continue
@@ -700,7 +706,11 @@ def slack_lookup_user_by_email(email: str) -> str | None:
     )
     data = resp.json()
     if not data.get("ok"):
-        logger.error("Slack users.lookupByEmail 失敗: %s", data)
+        if data.get("error") == "users_not_found":
+            # Slack Connect の外部ユーザーは自ワークスペース外のため必ずここに来る
+            logger.info("Slack users.lookupByEmail 未ヒット: %s", email)
+        else:
+            logger.error("Slack users.lookupByEmail 失敗: %s", data)
         return None
     return data.get("user", {}).get("id")
 
@@ -728,15 +738,112 @@ def slack_user_is_admin(user_id: str) -> bool:
 # 値が None の場合は「ルックアップ済みだが見つからなかった」ことを表す。
 _SLACK_USER_ID_CACHE: dict[str, str | None] = {}
 
+# 投稿先チャンネルごとの email(小文字) -> user_id マップのキャッシュ
+_CHANNEL_MEMBER_EMAIL_CACHE: dict[str, dict[str, str]] = {}
 
-def slack_user_id_for_email_cached(email: str) -> str | None:
+# email 突き合わせのために users.info を叩くメンバー数の上限。
+# 巨大チャンネルでのレートリミット消費を防ぐための保険。
+SLACK_MEMBER_SCAN_LIMIT = 500
+
+
+def slack_list_channel_member_ids(channel: str) -> list[str]:
+    """conversations.members でチャンネルのメンバー ID を列挙する(ページネーション対応)。"""
+    if not SLACK_BOT_TOKEN or not channel:
+        return []
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    member_ids: list[str] = []
+    cursor = ""
+    while True:
+        params: dict[str, Any] = {"channel": channel, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{SLACK_API_BASE}/conversations.members",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logger.error("Slack conversations.members 失敗: channel=%s %s", channel, data)
+            break
+        member_ids.extend(data.get("members") or [])
+        if len(member_ids) >= SLACK_MEMBER_SCAN_LIMIT:
+            logger.warning(
+                "チャンネルメンバーが多いため email 突き合わせを先頭 %d 人に制限します: channel=%s",
+                SLACK_MEMBER_SCAN_LIMIT,
+                channel,
+            )
+            member_ids = member_ids[:SLACK_MEMBER_SCAN_LIMIT]
+            break
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    return member_ids
+
+
+def slack_user_email(user_id: str) -> str | None:
+    """users.info から profile.email を取得する。取得できない場合は None。"""
+    if not SLACK_BOT_TOKEN or not user_id:
+        return None
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    for attempt in range(2):
+        resp = requests.get(
+            f"{SLACK_API_BASE}/users.info",
+            headers=headers,
+            params={"user": user_id},
+            timeout=30,
+        )
+        if resp.status_code == 429 and attempt == 0:
+            retry_after = int(resp.headers.get("Retry-After", "1"))
+            time.sleep(min(retry_after, 30))
+            continue
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning("Slack users.info 失敗: user=%s %s", user_id, data.get("error"))
+            return None
+        profile = (data.get("user") or {}).get("profile") or {}
+        return profile.get("email")
+    return None
+
+
+def slack_channel_member_email_map(channel: str) -> dict[str, str]:
+    """チャンネルメンバーの email(小文字) -> user_id マップを返す。
+
+    Slack Connect の外部ユーザーは users.lookupByEmail では検索できないため、
+    投稿先チャンネルのメンバーを users.info で突き合わせて解決するのに使う。
+    結果はチャンネルごとにプロセス内でキャッシュされる。
+    """
+    cached = _CHANNEL_MEMBER_EMAIL_CACHE.get(channel)
+    if cached is not None:
+        return cached
+    email_map: dict[str, str] = {}
+    for user_id in slack_list_channel_member_ids(channel):
+        email = slack_user_email(user_id)
+        if email:
+            email_map[email.lower()] = user_id
+    logger.info(
+        "チャンネルメンバーの email マップを構築: channel=%s 解決数=%d", channel, len(email_map)
+    )
+    _CHANNEL_MEMBER_EMAIL_CACHE[channel] = email_map
+    return email_map
+
+
+def slack_user_id_for_email_cached(email: str, fallback_channel: str | None = None) -> str | None:
     if not email:
         return None
     key = email.lower()
-    if key in _SLACK_USER_ID_CACHE:
-        return _SLACK_USER_ID_CACHE[key]
-    user_id = slack_lookup_user_by_email(email)
-    _SLACK_USER_ID_CACHE[key] = user_id
+    if key not in _SLACK_USER_ID_CACHE:
+        _SLACK_USER_ID_CACHE[key] = slack_lookup_user_by_email(email)
+    user_id = _SLACK_USER_ID_CACHE[key]
+    if user_id:
+        return user_id
+    # Slack Connect の外部ユーザーは users.lookupByEmail でヒットしないため、
+    # 投稿先チャンネルのメンバーの email と突き合わせて解決を試みる
+    if fallback_channel:
+        user_id = slack_channel_member_email_map(fallback_channel).get(key)
+        if user_id:
+            _SLACK_USER_ID_CACHE[key] = user_id
     return user_id
 
 
@@ -837,6 +944,14 @@ def handle_files_generated(payload: dict[str, Any]) -> tuple[dict[str, Any], int
     meeting_name = resolve_meeting_name(drive_service, recording_ids, transcript_ids)
     logger.info("会議名: %s", meeting_name)
 
+    # プレフィックス抽出 → 投稿先チャンネル決定
+    # (Slack Connect の外部ユーザーをメンション解決する際にチャンネルメンバーとの
+    #  突き合わせが必要になるため、Block 変換より先にチャンネルを決めておく)
+    prefix, _ = extract_prefix(meeting_name)
+    mapping_snapshot = get_prefix_mapping_snapshot()
+    target_config = mapping_snapshot.get(prefix) if prefix else None
+    mapped_channel = (target_config or {}).get("slack_channel") or None
+
     # 議事録本文の取得と Slack Block 変換 (先頭の transcript を使用)
     primary_transcript_id = transcript_ids[0]
     document = fetch_transcript_document(docs_service, primary_transcript_id)
@@ -844,13 +959,15 @@ def handle_files_generated(payload: dict[str, Any]) -> tuple[dict[str, Any], int
         return {"status": "error", "reason": "transcript_fetch_failed"}, 500
 
     primary_recording_id = recording_ids[0] if recording_ids else None
-    blocks = doc_to_slack_blocks(document, primary_recording_id, meeting_name, recording_ids)
+    blocks = doc_to_slack_blocks(
+        document,
+        primary_recording_id,
+        meeting_name,
+        recording_ids,
+        mention_channel=mapped_channel,
+    )
 
-    # プレフィックス抽出 → ファイル移動
-    prefix, _ = extract_prefix(meeting_name)
-    mapping_snapshot = get_prefix_mapping_snapshot()
-    target_config = mapping_snapshot.get(prefix) if prefix else None
-
+    # ファイル移動
     effective_prefix: str | None = prefix
     if target_config:
         folder_id = target_config.get("drive_folder_id", "")
@@ -870,10 +987,7 @@ def handle_files_generated(payload: dict[str, Any]) -> tuple[dict[str, Any], int
 
     # Slack 投稿先決定
     fallback_text = f"議事録: {meeting_name}"
-    channel: str | None = None
-    if effective_prefix:
-        mapped = mapping_snapshot.get(effective_prefix, {})
-        channel = mapped.get("slack_channel") or None
+    channel: str | None = mapped_channel if effective_prefix else None
 
     if not channel:
         user_id = slack_lookup_user_by_email(organizer_email)

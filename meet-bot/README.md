@@ -34,6 +34,8 @@ Google Meet の録画・文字起こし生成イベントを受け取り、議�
   - `users:read.email`
   - `im:write`
   - `commands`
+  - `channels:read` (Slack Connect 外部ユーザーのメンション解決に使用)
+  - `groups:read` (同上、プライベートチャンネル用)
 - App-Level Token (`xapp-...`) を発行し、`connections:write` スコープを付与
 - スラッシュコマンド `/meetbot` を登録 (Socket Mode の場合 Request URL は不要)
 
@@ -234,7 +236,8 @@ Invoke-RestMethod -Uri "http://localhost:8080/webhook" -Method Post `
 
 ## 制限事項・既知の挙動
 
-- Slack Connect 経由の外部ユーザーは `users.lookupByEmail` がヒットする場合のみメンションに置換されます。ヒットしない場合は `名前` テキスト表記のままです。
+- Slack Connect 経由の外部ユーザーは `users.lookupByEmail` では検索できないため、投稿先チャンネルのメンバーを `conversations.members` + `users.info` で列挙し、email を突き合わせてメンションに置換します。相手ワークスペースの設定で email が非公開の場合や、投稿先がチャンネルではなく DM の場合は解決できず、`名前` テキスト表記のままです。
+- 上記の突き合わせはチャンネルメンバー先頭 500 人までに制限されます (レートリミット対策)。結果はプロセス内でキャッシュされるため、チャンネルに後から参加したユーザーはプロセス再起動まで反映されないことがあります。
 - Slack の `header` block は plain_text のみのため、見出しの文字装飾やリンクは適用されません。
 - Slack メッセージあたりの section block は mrkdwn 3000 文字制限があり、約 2900 文字でチャンク分割しています。
 - Drive ファイル移動 (`files.update`) は共有ドライブを含むため `supportsAllDrives=True` で呼び出しています。Drive API 呼び出しは会議主催者 (`organizer_email`) に成りすました資格情報で行われるため、主催者が移動元ファイルおよび移動先フォルダに対する書き込み権限を持っている必要があります。
