@@ -319,11 +319,63 @@ def move_files_to_folder(
 
 
 def fetch_transcript_document(docs_service, document_id: str) -> dict[str, Any] | None:
+    # includeTabsContent を付けないと先頭タブ(クイックメモ)の内容しか返らないため、全タブを取得する
     try:
-        return docs_service.documents().get(documentId=document_id).execute()
+        return docs_service.documents().get(
+            documentId=document_id,
+            includeTabsContent=True,
+        ).execute()
     except HttpError as exc:
         logger.error("Docs取得失敗: document_id=%s %s", document_id, exc)
         return None
+
+
+# Gemini によるメモのドキュメントは「クイックメモ / 完全なメモ / 文字起こし」のタブ構成になっている。
+# 議事録として投稿するのは「完全なメモ」タブ。
+# "メモ" はクイックメモが追加される前の旧構成 (メモ / 文字起こし) のタブ名。
+NOTES_TAB_TITLES = ("完全なメモ", "メモ")
+# 議事録本文ではないタブ。タブ名が変わった場合のフォールバック選択で除外する。
+NON_NOTES_TAB_TITLES = {"クイックメモ", "文字起こし"}
+
+
+def iter_document_tabs(tabs: list[dict[str, Any]]):
+    """子タブも含めて、ドキュメントのタブを表示順に列挙する。"""
+    for tab in tabs or []:
+        yield tab
+        yield from iter_document_tabs(tab.get("childTabs", []) or [])
+
+
+def get_tab_title(tab: dict[str, Any]) -> str:
+    return ((tab.get("tabProperties") or {}).get("title") or "").strip()
+
+
+def select_notes_content(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """ドキュメントから議事録本文 (「完全なメモ」タブ) の content を取り出す。"""
+    tabs = [
+        tab for tab in iter_document_tabs(document.get("tabs", []) or [])
+        if tab.get("documentTab") is not None
+    ]
+    if not tabs:
+        # includeTabsContent なしで取得したドキュメント (タブ情報なし)
+        return document.get("body", {}).get("content", []) or []
+
+    selected: dict[str, Any] | None = None
+    for title in NOTES_TAB_TITLES:
+        selected = next((tab for tab in tabs if get_tab_title(tab) == title), None)
+        if selected is not None:
+            break
+    if selected is None:
+        # 想定したタブ名が無い場合は、クイックメモ・文字起こし以外の最初のタブを使う
+        selected = next(
+            (tab for tab in tabs if get_tab_title(tab) not in NON_NOTES_TAB_TITLES),
+            tabs[0],
+        )
+        logger.warning(
+            "「完全なメモ」タブが見つからないため「%s」タブを使用します: tabs=%s",
+            get_tab_title(selected),
+            [get_tab_title(tab) for tab in tabs],
+        )
+    return selected.get("documentTab", {}).get("body", {}).get("content", []) or []
 
 
 def build_drive_video_url(recording_id: str, seconds: int) -> str:
@@ -544,7 +596,7 @@ def doc_to_slack_blocks(
     recording_ids: list[str] | None = None,
     mention_channel: str | None = None,
 ) -> list[dict[str, Any]]:
-    content = document.get("body", {}).get("content", [])
+    content = select_notes_content(document)
     # rendered_lines: list of (kind, text)  kind in {"heading", "subheading", "text"}
     rendered_lines: list[tuple[str, str]] = []
 

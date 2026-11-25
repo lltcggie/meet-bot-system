@@ -168,7 +168,7 @@ docker run --user "$(id -u):$(id -g)" ...
    - 録画名がデフォルト (例: `wpi-xbcv-soe (2026-03-18 02:27 GMT+9)`) の場合はミーティングコードを会議名とする
    - recording が無ければ transcript 名: `<会議名> - YYYY/MM/DD HH:mm JST - Gemini によるメモ`
    - transcript もデフォルト (`... に開始した会議 - Gemini によるメモ`) の場合は「会議」を会議名とする
-4. Docs API で transcript を取得
+4. Docs API で transcript を取得 (全タブを取得し、「完全なメモ」タブを議事録本文として使用。「クイックメモ」「文字起こし」タブは対象外)
 5. Slack の Block Kit に変換
    - 見出し (`HEADING_1/2/TITLE`): `header` block + 📌 絵文字
    - 中見出し以下 (`HEADING_3/4/5/6/SUBTITLE`): `header` block
